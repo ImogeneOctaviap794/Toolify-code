@@ -66,11 +66,26 @@ class AnthropicMessage(BaseModel):
     
     model: str
     messages: List[Dict[str, Any]]
-    max_tokens: int  # Required in Anthropic API
+    max_tokens: int = 4096  # Default to 4096 for better compatibility
     system: Optional[Union[str, List[Dict[str, Any]]]] = None  # Can be string or array with cache_control
     temperature: Optional[float] = None
     top_p: Optional[float] = None
+    top_k: Optional[int] = None  # Anthropic specific
     stream: Optional[bool] = False
     stop_sequences: Optional[List[str]] = None
     tools: Optional[List[Dict[str, Any]]] = None
+    metadata: Optional[Dict[str, Any]] = None  # For user_id tracking etc.
+
+
+class GeminiRequest(BaseModel):
+    """Google Gemini API request model."""
+    model_config = ConfigDict(extra="allow")
+    
+    model: str  # For internal use (not sent to Gemini API)
+    contents: List[Dict[str, Any]]
+    systemInstruction: Optional[Dict[str, Any]] = None
+    generationConfig: Optional[Dict[str, Any]] = None
+    tools: Optional[List[Dict[str, Any]]] = None
+    safetySettings: Optional[List[Dict[str, Any]]] = None
+    stream: Optional[bool] = False  # For internal routing (not sent in request body)
 

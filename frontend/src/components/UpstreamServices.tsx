@@ -18,22 +18,55 @@ export default function UpstreamServices({ config, setConfig }: UpstreamServices
   const [jsonText, setJsonText] = useState('')
   const [jsonError, setJsonError] = useState('')
 
+  // 服务类型对应的默认配置
+  const getServiceDefaults = (serviceType: string) => {
+    const defaults: Record<string, {baseUrl: string, models: string[]}> = {
+      openai: {
+        baseUrl: 'https://api.openai.com/v1',
+        models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo']
+      },
+      anthropic: {
+        baseUrl: 'https://api.anthropic.com',
+        models: ['claude-3-5-sonnet-20241022', 'claude-3-opus-20240229', 'claude-3-haiku-20240307']
+      },
+      gemini: {
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        models: ['gemini-2.0-flash-exp', 'gemini-exp-1206', 'gemini-1.5-pro', 'gemini-1.5-flash']
+      }
+    }
+    return defaults[serviceType] || defaults.openai
+  }
+
   const addService = () => {
+    const defaults = getServiceDefaults('openai')
     const newService = {
       name: `service-${config.upstream_services.length + 1}`,
       service_type: 'openai',
-      base_url: 'https://api.example.com/v1',
+      base_url: defaults.baseUrl,
       api_key: '',
       description: '',
       is_default: false,
       priority: config.upstream_services.length * 10,
       inject_function_calling: null,  // null = inherit from global
       model_mapping: {},
-      models: []
+      models: defaults.models
     }
     setConfig({
       ...config,
       upstream_services: [...config.upstream_services, newService]
+    })
+  }
+
+  // 当服务类型变化时，自动更新 base_url 和 models
+  const handleServiceTypeChange = (index: number, newType: string) => {
+    const defaults = getServiceDefaults(newType)
+    const services = [...config.upstream_services]
+    services[index].service_type = newType
+    services[index].base_url = defaults.baseUrl
+    services[index].models = defaults.models
+    setConfig({
+      ...config,
+      upstream_services: services
     })
   }
 
@@ -317,14 +350,14 @@ export default function UpstreamServices({ config, setConfig }: UpstreamServices
                   <select
                     className="flex h-10 w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm focus:border-blue-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 transition-colors"
                     value={service.service_type || 'openai'}
-                    onChange={(e) => updateService(index, 'service_type', e.target.value)}
+                    onChange={(e) => handleServiceTypeChange(index, e.target.value)}
                   >
-                    <option value="openai">OpenAI</option>
-                    <option value="google">Google</option>
-                    <option value="anthropic">Anthropic</option>
+                    <option value="openai">OpenAI - Chat Completions API</option>
+                    <option value="anthropic">Anthropic - Claude Messages API</option>
+                    <option value="gemini">Gemini - Google AI API</option>
                   </select>
                   <p className="text-sm text-gray-500">
-                    服务提供商类型（OpenAI 格式兼容）
+                    API 格式类型 - 支持 OpenAI ↔ Anthropic ↔ Gemini 三向互转
                   </p>
                 </div>
 

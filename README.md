@@ -26,7 +26,9 @@
 - 🎨 **Web Admin UI** - React 19 + TypeScript visual configuration
 - ⚡ **Real-time Reload** - Config changes take effect instantly
 - 🔄 **Multi-Channel Failover** - Smart priority-based routing
-- 🌐 **Multi-API Support** - OpenAI + Anthropic Claude formats
+- 🌐 **Multi-API Support** - OpenAI + Anthropic + Gemini formats (3-way conversion!)
+- 🔍 **Capability Detection** - Test AI provider capabilities automatically
+- 🧠 **Reasoning Budget** - Smart conversion between reasoning_effort and thinking tokens
 - 📱 **Responsive Design** - Perfect for mobile and desktop
 
 </div>
@@ -58,7 +60,9 @@
 ### 🛡️ Enterprise Features
 
 - 🔄 **Multi-Channel Failover** - Smart priority-based routing
-- 🌐 **Multi-API Format** - OpenAI + Anthropic Claude support
+- 🌐 **Multi-API Format** - OpenAI + Anthropic + Gemini (3-way conversion)
+- 🔍 **Capability Detection** - Automated testing of AI features
+- 🧠 **Reasoning Budget** - Intelligent effort/token conversion
 - 🔐 **Secure Auth** - JWT Token + bcrypt encryption
 - ⚡ **Real-time Reload** - Zero-downtime config updates
 - 📊 **Visual Management** - Modern web interface
@@ -70,11 +74,29 @@
 
 ## How It Works
 
-1. **Intercept Request**: Toolify intercepts the `chat/completions` request from the client, which includes the desired tools.
-2. **Inject Prompt**: It generates a specific system prompt instructing the LLM how to output function calls using a structured XML format and a unique trigger signal.
-3. **Proxy to Upstream**: The modified request is sent to the configured upstream LLM service.
-4. **Parse Response**: Toolify analyzes the upstream response. If the trigger signal is detected, it parses the XML structure to extract the function calls.
-5. **Format Response**: It transforms the parsed tool calls into the standard OpenAI `tool_calls` format and sends it back to the client.
+1. **Intercept Request**: Toolify intercepts API requests (OpenAI/Anthropic/Gemini formats), which includes the desired tools.
+2. **Format Detection**: Automatically detects the source API format based on request structure.
+3. **Inject Prompt**: Generates a specific system prompt instructing the LLM how to output function calls using XML format.
+4. **Convert & Proxy**: Converts request to target format and proxies to configured upstream LLM service.
+5. **Parse Response**: Analyzes upstream response. If trigger signal is detected, parses XML structure to extract function calls.
+6. **Format Response**: Transforms tool calls to match the client's expected format and sends back.
+
+## 🌐 Supported API Formats
+
+| Format | Request Endpoint | Response Format | Auth Method |
+|--------|-----------------|-----------------|-------------|
+| **OpenAI** | `POST /v1/chat/completions` | OpenAI JSON | `Authorization: Bearer` |
+| **Anthropic** | `POST /v1/messages` | Anthropic JSON | `x-api-key` header |
+| **Gemini** | `POST /v1beta/models/{model}:generateContent` | Gemini JSON | `key` parameter |
+
+**Format Conversion Matrix:**
+
+```
+     OpenAI ←→ Anthropic ←→ Gemini
+       ↑           ↑           ↑
+       └───────────┴───────────┘
+            All directions supported!
+```
 
 ## 🏗️ Architecture
 
@@ -485,7 +507,86 @@ Frontend Tech Stack:
 - Vite build tool
 - Tailwind CSS + shadcn/ui component library
 
+## 🔍 Capability Detection
+
+Toolify includes a powerful capability detection system to test AI provider features automatically:
+
+```python
+# Use the capability detection API
+POST /api/detect/capabilities
+{
+  "provider": "openai",  // or "anthropic", "gemini"
+  "api_key": "your-key",
+  "base_url": "https://api.openai.com/v1",  // optional
+  "model": "gpt-4o"  // optional
+}
+```
+
+**Detectable Capabilities:**
+- ✅ Basic chat completion
+- ✅ Streaming responses
+- ✅ Function calling / Tool use
+- ✅ Vision / Image understanding
+- ✅ System messages
+- ✅ JSON mode / Structured output
+
+## 🧠 Reasoning Budget Conversion
+
+Toolify automatically converts reasoning parameters between different formats:
+
+| OpenAI | Anthropic | Gemini | Description |
+|--------|-----------|--------|-------------|
+| `reasoning_effort: "low"` | `thinkingBudget: 2048` | `thinkingBudget: 2048` | Light reasoning |
+| `reasoning_effort: "medium"` | `thinkingBudget: 8192` | `thinkingBudget: 8192` | Moderate reasoning |
+| `reasoning_effort: "high"` | `thinkingBudget: 16384` | `thinkingBudget: 16384` | Deep reasoning |
+
+**Example:**
+```python
+# Client sends OpenAI format with reasoning_effort
+{
+  "model": "o1-preview",
+  "reasoning_effort": "high",
+  "messages": [...]
+}
+
+# Toolify automatically converts to Anthropic/Gemini
+{
+  "model": "claude-3-opus",
+  "thinkingBudget": 16384,  # Auto-converted!
+  "messages": [...]
+}
+```
+
 ## Configuration Examples
+
+### Multi-Provider Configuration
+
+```yaml
+upstream_services:
+  # OpenAI Service
+  - name: "openai-primary"
+    service_type: "openai"
+    base_url: "https://api.openai.com/v1"
+    api_key: "sk-..."
+    priority: 100
+    models: ["gpt-4", "gpt-4o", "o1-preview"]
+  
+  # Anthropic Claude Service
+  - name: "anthropic-claude"
+    service_type: "anthropic"
+    base_url: "https://api.anthropic.com"
+    api_key: "sk-ant-..."
+    priority: 90
+    models: ["claude-3-5-sonnet-20241022", "claude-3-opus"]
+  
+  # Google Gemini Service
+  - name: "google-gemini"
+    service_type: "gemini"
+    base_url: "https://generativelanguage.googleapis.com/v1beta"
+    api_key: "AI..."
+    priority: 80
+    models: ["gemini-2.0-flash-exp", "gemini-1.5-pro"]
+```
 
 ### Per-Service Function Calling Control
 

@@ -10,7 +10,7 @@ server:
 # Upstream OpenAI compatible service configuration
 upstream_services:
   - name: "openai-primary"
-    service_type: "openai"  # Service type: openai, google, anthropic, etc.
+    service_type: "openai"  # Service type: openai, anthropic, gemini
     base_url: "https://api.openai.com/v1"
     api_key: "your-openai-api-key-here"
     description: "OpenAI Official Service"
@@ -37,20 +37,34 @@ upstream_services:
       - "gpt-4"
       - "gpt-4o"
 
+  - name: "anthropic-claude"
+    service_type: "anthropic"
+    base_url: "https://api.anthropic.com"
+    api_key: "your-anthropic-api-key-here"
+    description: "Anthropic Claude Service"
+    is_default: false
+    priority: 90
+    models:
+      - "claude-3-5-sonnet-20241022"
+      - "claude-3-opus-20240229"
+      - "claude-3-haiku-20240307"
+
   - name: "google-gemini"
-    service_type: "google"
-    base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+    service_type: "gemini"
+    base_url: "https://generativelanguage.googleapis.com/v1beta"
     api_key: "your-google-api-key-here"
     description: "Google Gemini Service"
     is_default: false
     priority: 80  # High priority for Google services
     models:
       # Use alias "gemini-2.5" to randomly select one of the following models
-      - "gemini-2.5:gemini-2.5-pro"
-      - "gemini-2.5:gemini-2.5-flash"
+      - "gemini-2.5:gemini-2.0-flash-exp"
+      - "gemini-2.5:gemini-exp-1206"
       # You can also define models that can be used directly
-      - "gemini-2.5-pro"
-      - "gemini-2.5-flash"
+      - "gemini-2.0-flash-exp"
+      - "gemini-exp-1206"
+      - "gemini-1.5-pro"
+      - "gemini-1.5-flash"
 
 # Client authentication configuration
 client_authentication:
@@ -68,10 +82,29 @@ admin_authentication:
 # Feature configuration
 features:
   enable_function_calling: true  # Enable function calling feature globally (can be overridden per service)
+  enable_capability_detection: true  # Enable capability detection API endpoints
+  enable_format_conversion: true     # Enable automatic format conversion between OpenAI/Anthropic/Gemini
   log_level: "INFO"              # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL, or DISABLED
   convert_developer_to_system: true  # Whether to convert the developer role to the system role
   key_passthrough: false          # If true, directly forward client-provided API key to upstream instead of using configured upstream key
   model_passthrough: false         # If true, forward all requests directly to the 'openai' upstream service, ignoring model-based routing
+  
+  # Reasoning budget conversion mappings (OpenAI reasoning_effort ↔ Anthropic/Gemini thinkingBudget)
+  reasoning_budget_mapping:
+    openai_to_anthropic:
+      low: 2048
+      medium: 8192
+      high: 16384
+    openai_to_gemini:
+      low: 2048
+      medium: 8192
+      high: 16384
+    anthropic_to_openai_thresholds:
+      low: 2048      # tokens <= 2048 = low
+      high: 16384    # tokens >= 16384 = high, otherwise medium
+    gemini_to_openai_thresholds:
+      low: 2048
+      high: 16384
   
   # Custom prompt template (optional). If not provided, the default prompt will be used.
   # The default prompt includes comprehensive features:

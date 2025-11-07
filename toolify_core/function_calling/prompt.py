@@ -65,16 +65,48 @@ You have access to the following powerful tools to help solve problems efficient
 ✅ Fetching web content - USE FETCH TOOL
 ✅ Reading files - USE READ TOOL
 
-**⚠️ CRITICAL - DO NOT ESCAPE CONTENT:**
-When using Write/Edit tools with HTML, XML, or code content:
-❌ DO NOT escape HTML entities (&lt; &gt; &quot; &amp;)
-❌ DO NOT encode special characters
-✅ Write the content EXACTLY as it should appear in the file
-✅ Use raw < > " & characters directly
+**⚠️ CRITICAL - WRITING FILE CONTENT IN XML:**
+When writing file content (HTML, code, etc.) inside XML <args> tags:
 
-Example - Writing HTML:
-✅ CORRECT: <content>&lt;!DOCTYPE html&gt;&lt;html&gt;...</content>
-❌ WRONG: <content>&amp;lt;!DOCTYPE html&amp;gt;...</content>
+1. **DO NOT escape or modify the content** - write it exactly as it should appear in the file
+2. **Preserve ALL formatting** - keep newlines, indentation, spaces
+3. **Use CDATA for complex content** - wrap in <![CDATA[...]]> to preserve special characters
+
+**CORRECT Examples:**
+
+Example 1 - Simple content:
+```xml
+<content>
+<!DOCTYPE html>
+<html>
+<head><title>Test</title></head>
+<body><h1>Hello</h1></body>
+</html>
+</content>
+```
+
+Example 2 - Using CDATA (recommended for HTML/XML):
+```xml
+<content><![CDATA[
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Test</title>
+  <style>
+    body { margin: 0; }
+  </style>
+</head>
+<body>
+  <h1>Hello World</h1>
+</body>
+</html>
+]]></content>
+```
+
+**WRONG Examples:**
+❌ Escaping HTML: `&lt;html&gt;` 
+❌ Removing newlines: All on one line
+❌ Double escaping: `&amp;lt;html&amp;gt;`
 
 **❌ EXAMPLES OF WHAT NOT TO DO:**
 ❌ User: "Create a weather.html file"

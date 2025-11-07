@@ -16,7 +16,7 @@ import traceback
 import time
 import logging
 import yaml
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, Request, Header, HTTPException, Depends, status
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -25,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 
 # Toolify modules
-from toolify_core.models import ChatCompletionRequest, AnthropicMessage, Tool, ToolFunction
+from toolify_core.models import ChatCompletionRequest, AnthropicMessage, GeminiRequest, Tool, ToolFunction
 from toolify_core.token_counter import TokenCounter
 from config_loader import config_loader, AppConfig
 from admin_auth import (
@@ -38,6 +38,24 @@ from toolify_core.function_calling import (
     parse_function_calls_xml
 )
 from toolify_core.tool_mapping import store_tool_call_mapping
+
+# Format converters (new unified system)
+from toolify_core.converters import (
+    ConverterFactory,
+    OpenAIConverter,
+    AnthropicConverter,
+    GeminiConverter
+)
+
+# Capability detection
+from toolify_core.capability_detector import (
+    DetectorFactory,
+    OpenAICapabilityDetector,
+    AnthropicCapabilityDetector,
+    GeminiCapabilityDetector
+)
+
+# Backward compatibility - keep old adapter functions
 from toolify_core.anthropic_adapter import (
     anthropic_to_openai_request,
     openai_to_anthropic_response,
@@ -52,6 +70,44 @@ from toolify_core.upstream_router import find_upstream
 from toolify_core.streaming_proxy import stream_proxy_with_fc_transform
 
 logger = logging.getLogger(__name__)
+
+
+def build_upstream_url(base_url: str, endpoint: str) -> str:
+    """
+    智能构建上游URL，自动处理 /v1 路径
+    
+    Args:
+        base_url: 上游基础URL
+        endpoint: 端点路径（如 /chat/completions, /messages）
+    
+    Returns:
+        完整的URL
+    """
+    # 移除尾部斜杠
+    base_url = base_url.rstrip('/')
+    
+    # 如果 endpoint 不以 / 开头，添加
+    if not endpoint.startswith('/'):
+        endpoint = '/' + endpoint
+    
+    # 智能处理 /v1 前缀
+    # 如果 base_url 已经包含 /v1, /v1beta 等，直接拼接
+    if any(base_url.endswith(suffix) for suffix in ['/v1', '/v1beta', '/v1alpha']):
+        return base_url + endpoint
+    
+    # 如果 endpoint 需要 /v1 但 base_url 没有，自动添加
+    # OpenAI 端点
+    if endpoint in ['/chat/completions', '/completions', '/models', '/embeddings']:
+        if '/v1' not in base_url:
+            return base_url + '/v1' + endpoint
+    
+    # Anthropic 端点 - 已经包含 /v1/messages
+    if endpoint.startswith('/v1/'):
+        return base_url + endpoint
+    
+    # 默认直接拼接
+    return base_url + endpoint
+
 
 # Global variables
 app_config: AppConfig = None
@@ -106,19 +162,42 @@ def load_runtime_config(reload: bool = False):
     logger.info(f"🔄 Default service: {DEFAULT_SERVICE['name']}")
 
 
-# Load configuration at startup
-try:
-    load_runtime_config()
-except Exception as e:
-    logger.error(f"❌ Configuration loading failed: {type(e).__name__}")
-    logger.error(f"❌ Error details: {str(e)}")
-    logger.error("💡 Please ensure config.yaml file exists and is properly formatted")
-    exit(1)
-
-
-# Initialize FastAPI app
+# Initialize FastAPI app (don't load config at module level for better IDE support)
 app = FastAPI()
 http_client = httpx.AsyncClient()
+
+# Register converters
+ConverterFactory.register_converter("openai", OpenAIConverter)
+ConverterFactory.register_converter("anthropic", AnthropicConverter)
+ConverterFactory.register_converter("gemini", GeminiConverter)
+logger.info("✅ Registered format converters: OpenAI, Anthropic, Gemini")
+
+# Register capability detectors
+DetectorFactory.register_detector("openai", OpenAICapabilityDetector)
+DetectorFactory.register_detector("anthropic", AnthropicCapabilityDetector)
+DetectorFactory.register_detector("gemini", GeminiCapabilityDetector)
+logger.info("✅ Registered capability detectors: OpenAI, Anthropic, Gemini")
+
+# Flag to track if configuration is loaded
+_config_loaded = False
+
+
+def ensure_config_loaded():
+    """Ensure configuration is loaded before handling requests."""
+    global _config_loaded
+    if not _config_loaded:
+        try:
+            load_runtime_config()
+            _config_loaded = True
+            logger.info("✅ Configuration loaded successfully on first request")
+        except Exception as e:
+            logger.error(f"❌ Configuration loading failed: {type(e).__name__}")
+            logger.error(f"❌ Error details: {str(e)}")
+            logger.error("💡 Please ensure config.yaml file exists and is properly formatted")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Server configuration error: {str(e)}"
+            )
 
 # Add CORS middleware for development
 app.add_middleware(
@@ -132,12 +211,13 @@ app.add_middleware(
 
 @app.middleware("http")
 async def debug_middleware(request: Request, call_next):
-    """Middleware for debugging validation errors, does not log conversation content."""
+    """Middleware for debugging - logs response status."""
     response = await call_next(request)
     
     if response.status_code == 422:
-        logger.debug(f"🔍 Validation error detected for {request.method} {request.url.path}")
-        logger.debug(f"🔍 Response status code: 422 (Pydantic validation failure)")
+        logger.error(f"🔍 ❌ Validation failed for {request.method} {request.url.path}")
+        logger.error(f"🔍 Response status code: 422 (Pydantic validation failure)")
+        logger.error(f"🔍 Check the detailed error logs above for validation details")
     
     return response
 
@@ -146,16 +226,18 @@ async def debug_middleware(request: Request, call_next):
 async def validation_exception_handler(request: Request, exc: ValidationError):
     """Handle Pydantic validation errors with detailed error information."""
     logger.error("=" * 80)
-    logger.error("❌ Pydantic Validation Error")
+    logger.error("❌ PYDANTIC VALIDATION ERROR DETAILS")
     logger.error("=" * 80)
     logger.error(f"📍 Request URL: {request.url}")
     logger.error(f"📍 Request Method: {request.method}")
+    logger.error(f"📍 Model being validated: {exc.title if hasattr(exc, 'title') else 'Unknown'}")
     
     # Log request headers
     logger.error(f"📋 Request Headers:")
     for header_name, header_value in request.headers.items():
-        if header_name.lower() == "authorization":
-            logger.error(f"   {header_name}: Bearer ***{header_value[-8:] if len(header_value) > 8 else '***'}")
+        if header_name.lower() in ["authorization", "x-api-key"]:
+            masked_value = "***" + header_value[-8:] if len(header_value) > 8 else "***"
+            logger.error(f"   {header_name}: {masked_value}")
         else:
             logger.error(f"   {header_name}: {header_value}")
     
@@ -163,10 +245,25 @@ async def validation_exception_handler(request: Request, exc: ValidationError):
     try:
         body_bytes = await request.body()
         body_text = body_bytes.decode('utf-8')
-        logger.error(f"📦 Raw Request Body (first 1000 chars):")
-        logger.error(body_text[:1000])
-        if len(body_text) > 1000:
+        logger.error(f"📦 Raw Request Body (first 2000 chars):")
+        logger.error(body_text[:2000])
+        if len(body_text) > 2000:
             logger.error(f"   ... (total {len(body_text)} chars)")
+        
+        # Try to parse as JSON for better readability
+        try:
+            import json
+            body_json = json.loads(body_text)
+            logger.error(f"📦 Parsed Request JSON:")
+            logger.error(f"   Keys: {list(body_json.keys())}")
+            logger.error(f"   Model: {body_json.get('model', 'N/A')}")
+            logger.error(f"   Messages count: {len(body_json.get('messages', []))}")
+            logger.error(f"   Max tokens: {body_json.get('max_tokens', 'NOT PROVIDED')}")
+            logger.error(f"   Stream: {body_json.get('stream', 'N/A')}")
+            logger.error(f"   Tools: {len(body_json.get('tools', []))} tools")
+        except:
+            pass
+            
     except Exception as e:
         logger.error(f"⚠️  Could not read request body: {e}")
     
@@ -178,14 +275,21 @@ async def validation_exception_handler(request: Request, exc: ValidationError):
         logger.error(f"      Type: {error.get('type')}")
         if 'input' in error:
             input_repr = repr(error['input'])
-            logger.error(f"      Input: {input_repr[:200]}{'...' if len(input_repr) > 200 else ''}")
+            logger.error(f"      Input: {input_repr[:300]}{'...' if len(input_repr) > 300 else ''}")
     logger.error("=" * 80)
+    
+    # Build user-friendly error message
+    error_messages = []
+    for error in exc.errors():
+        field = ' -> '.join(str(loc) for loc in error.get('loc', []))
+        msg = error.get('msg', 'Validation error')
+        error_messages.append(f"{field}: {msg}")
     
     return JSONResponse(
         status_code=422,
         content={
             "error": {
-                "message": "Invalid request format",
+                "message": "Request validation failed: " + "; ".join(error_messages[:3]),
                 "type": "invalid_request_error",
                 "code": "invalid_request",
                 "details": exc.errors()
@@ -216,18 +320,41 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 async def verify_api_key(authorization: str = Header(...)):
     """Dependency: verify client API key."""
-    client_key = authorization.replace("Bearer ", "")
+    logger.debug(f"🔐 API Key Verification")
+    logger.debug(f"   Authorization header: {authorization[:20]}...{authorization[-8:] if len(authorization) > 20 else authorization}")
+    
+    if not authorization:
+        logger.error("❌ Missing Authorization header")
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    
+    # Extract key
+    if authorization.startswith("Bearer "):
+        client_key = authorization[7:]
+    else:
+        # Some clients might not include "Bearer " prefix
+        client_key = authorization
+    
+    logger.debug(f"   Extracted key: ***{client_key[-8:] if len(client_key) > 8 else '***'}")
+    
     if app_config.features.key_passthrough:
-        # In passthrough mode, skip allowed_keys check
+        logger.debug(f"   Mode: Key passthrough (validation skipped)")
         return client_key
+    
+    logger.debug(f"   Mode: Validating against {len(ALLOWED_CLIENT_KEYS)} allowed keys")
+    logger.debug(f"   Allowed keys: {[f'***{k[-8:]}' for k in ALLOWED_CLIENT_KEYS]}")
+    
     if client_key not in ALLOWED_CLIENT_KEYS:
+        logger.error(f"❌ Unauthorized key: ***{client_key[-8:]}")
         raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    logger.debug(f"✅ Key validated successfully")
     return client_key
 
 
 @app.get("/")
 def read_root():
     """Root endpoint showing service status."""
+    ensure_config_loaded()
     return {
         "status": "OpenAI Function Call Middleware is running",
         "config": {
@@ -251,6 +378,7 @@ async def chat_completions(
     _api_key: str = Depends(verify_api_key)
 ):
     """Main chat completion endpoint, proxy and inject function calling capabilities."""
+    ensure_config_loaded()
     start_time = time.time()
     
     # Count input tokens
@@ -375,7 +503,7 @@ async def chat_completions(
     if not body.stream:
         # Non-streaming: try each upstream with failover
         for upstream_idx, upstream in enumerate(upstreams):
-            upstream_url = f"{upstream['base_url']}/chat/completions"
+            upstream_url = build_upstream_url(upstream['base_url'], '/chat/completions')
 
             headers = {
                 "Content-Type": "application/json",
@@ -601,7 +729,7 @@ async def chat_completions(
     else:
         # Streaming: use the highest priority upstream (first in list)
         upstream = upstreams[0]
-        upstream_url = f"{upstream['base_url']}/chat/completions"
+        upstream_url = build_upstream_url(upstream['base_url'], '/chat/completions')
 
         headers = {
             "Content-Type": "application/json",
@@ -736,25 +864,94 @@ async def chat_completions(
         )
 
 
+async def verify_anthropic_api_key(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+    authorization: Optional[str] = Header(None)
+) -> str:
+    """Verify Anthropic API key from x-api-key or Authorization header."""
+    logger.debug(f"🔐 Anthropic API Key Verification")
+    
+    # Priority 1: x-api-key header (standard Anthropic)
+    if x_api_key:
+        logger.debug(f"   Using x-api-key header: ***{x_api_key[-8:] if len(x_api_key) > 8 else '***'}")
+        client_key = x_api_key
+    # Priority 2: Authorization Bearer (for Claude CLI compatibility)
+    elif authorization:
+        logger.debug(f"   Using Authorization header: {authorization[:20]}...")
+        if authorization.startswith("Bearer "):
+            client_key = authorization[7:]
+        else:
+            client_key = authorization
+        logger.debug(f"   Extracted key: ***{client_key[-8:] if len(client_key) > 8 else '***'}")
+    else:
+        logger.error("❌ Missing authentication header")
+        raise HTTPException(
+            status_code=401,
+            detail="Missing authentication. Please provide 'x-api-key' or 'Authorization: Bearer' header"
+        )
+    
+    # Validate key if not in passthrough mode
+    if not app_config.features.key_passthrough:
+        logger.debug(f"   Validating against {len(ALLOWED_CLIENT_KEYS)} allowed keys")
+        if client_key not in ALLOWED_CLIENT_KEYS:
+            logger.error(f"❌ Unauthorized key: ***{client_key[-8:]}")
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    logger.debug(f"✅ Anthropic key validated successfully")
+    return client_key
+
+
 @app.post("/v1/messages")
 async def anthropic_messages(
         request: Request,
         body: AnthropicMessage,
-        _api_key: str = Depends(verify_api_key)
+        _api_key: str = Depends(verify_anthropic_api_key)
 ):
     """Anthropic Messages API endpoint - converts to OpenAI format and back."""
+    ensure_config_loaded()
     start_time = time.time()
     
-    logger.info(f"📨 Anthropic API request to model: {body.model}")
-    logger.info(f"📊 Max tokens: {body.max_tokens}, Stream: {body.stream}")
+    # 详细日志 - 请求信息
+    logger.info("=" * 80)
+    logger.info("📨 ANTHROPIC API REQUEST")
+    logger.info("=" * 80)
+    logger.info(f"🔑 Client API Key: ***{_api_key[-8:] if len(_api_key) > 8 else '***'}")
+    logger.info(f"📋 Request Headers:")
+    for name, value in request.headers.items():
+        if name.lower() in ["authorization", "x-api-key"]:
+            logger.info(f"   {name}: ***{value[-8:] if len(value) > 8 else '***'}")
+        else:
+            logger.info(f"   {name}: {value}")
+    
+    logger.info(f"📊 Request Body:")
+    logger.info(f"   Model: {body.model}")
+    logger.info(f"   Max tokens: {body.max_tokens}")
+    logger.info(f"   Stream: {body.stream}")
+    logger.info(f"   Messages: {len(body.messages)} messages")
+    logger.info(f"   System: {'Yes' if body.system else 'No'}")
+    logger.info(f"   Tools: {len(body.tools) if body.tools else 0} tools")
+    logger.info(f"   Temperature: {body.temperature}")
+    logger.info(f"   Top P: {body.top_p}")
+    logger.info(f"   Top K: {body.top_k if hasattr(body, 'top_k') else 'N/A'}")
+    logger.info("=" * 80)
     
     try:
         # Convert Anthropic request to OpenAI format
         anthropic_dict = body.model_dump()
+        
+        logger.info("🔄 Converting Anthropic request to OpenAI format...")
+        logger.debug(f"📦 Anthropic dict keys: {list(anthropic_dict.keys())}")
+        logger.debug(f"📦 Anthropic dict (first 500 chars): {str(anthropic_dict)[:500]}")
+        
         openai_request = anthropic_to_openai_request(anthropic_dict)
         
-        logger.debug(f"🔄 Converted Anthropic request to OpenAI format")
-        logger.debug(f"🔧 OpenAI messages: {len(openai_request['messages'])}")
+        logger.info(f"✅ Converted to OpenAI format")
+        logger.info(f"   OpenAI messages: {len(openai_request['messages'])}")
+        logger.info(f"   OpenAI model: {openai_request.get('model')}")
+        logger.info(f"   OpenAI max_tokens: {openai_request.get('max_tokens')}")
+        logger.info(f"   OpenAI stream: {openai_request.get('stream')}")
+        logger.debug(f"📦 Full OpenAI request: {openai_request}")
         
         # Check for tool role messages
         tool_role_msgs = [m for m in openai_request['messages'] if isinstance(m, dict) and m.get('role') == 'tool']
@@ -783,7 +980,14 @@ async def anthropic_messages(
         )
         upstream = upstreams[0]  # Use highest priority upstream
         
-        logger.info(f"🎯 Using upstream: {upstream['name']} (priority: {upstream.get('priority', 0)})")
+        logger.info("🎯 UPSTREAM SELECTION")
+        logger.info(f"   Upstream name: {upstream['name']}")
+        logger.info(f"   Service type: {upstream.get('service_type', 'N/A')}")
+        logger.info(f"   Priority: {upstream.get('priority', 0)}")
+        logger.info(f"   Base URL: {upstream['base_url']}")
+        logger.info(f"   API Key: ***{upstream['api_key'][-8:] if len(upstream.get('api_key', '')) > 8 else '***'}")
+        logger.info(f"   Actual model: {actual_model}")
+        logger.info(f"   FC injection: {upstream.get('inject_function_calling', 'inherit')}")
         
         # Apply Toolify's function calling logic if tools are present
         has_tools = "tools" in openai_request and openai_request["tools"]
@@ -858,65 +1062,136 @@ async def anthropic_messages(
         # Update model to actual upstream model
         openai_request["model"] = actual_model
         
-        # Prepare request headers
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {_api_key}" if app_config.features.key_passthrough else f"Bearer {upstream['api_key']}",
-        }
+        # 🔧 根据上游服务类型决定请求格式和端点
+        upstream_service_type = upstream.get('service_type', 'openai')
         
-        upstream_url = f"{upstream['base_url']}/chat/completions"
+        logger.info(f"🔄 FORMAT ROUTING")
+        logger.info(f"   Client format: Anthropic")
+        logger.info(f"   Upstream type: {upstream_service_type}")
+        
+        # 准备发送到上游的请求和URL
+        if upstream_service_type == 'anthropic':
+            # Anthropic → Anthropic: 直接使用原始 Anthropic 格式
+            logger.info(f"   Strategy: Direct Anthropic passthrough")
+            final_request = anthropic_dict  # 使用原始 Anthropic 请求
+            upstream_url = f"{upstream['base_url'].rstrip('/')}/v1/messages"
+            headers = {
+                "Content-Type": "application/json",
+                "x-api-key": _api_key if app_config.features.key_passthrough else upstream['api_key'],
+                "anthropic-version": "2023-06-01"
+            }
+        elif upstream_service_type == 'openai':
+            # Anthropic → OpenAI: 使用已转换的 OpenAI 格式
+            logger.info(f"   Strategy: Convert to OpenAI format")
+            final_request = openai_request
+            upstream_url = build_upstream_url(upstream['base_url'], '/chat/completions')
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {_api_key}" if app_config.features.key_passthrough else f"Bearer {upstream['api_key']}",
+            }
+        elif upstream_service_type == 'gemini':
+            # Anthropic → Gemini: 需要转换为 Gemini 格式
+            logger.info(f"   Strategy: Convert to Gemini format")
+            from toolify_core.converters import convert_request
+            conversion = convert_request("anthropic", "gemini", anthropic_dict)
+            if not conversion.success:
+                raise HTTPException(status_code=500, detail=f"Format conversion failed: {conversion.error}")
+            final_request = conversion.data
+            # Gemini 需要从 final_request 中移除 model 和 stream 字段
+            gemini_model = final_request.pop('model', actual_model)
+            final_request.pop('stream', None)
+            upstream_url = f"{upstream['base_url'].rstrip('/')}/models/{gemini_model}:generateContent?key={upstream['api_key']}"
+            headers = {"Content-Type": "application/json"}
+        else:
+            raise HTTPException(status_code=500, detail=f"Unsupported upstream service type: {upstream_service_type}")
+        
+        logger.info("🚀 SENDING TO UPSTREAM")
+        logger.info(f"   URL: {upstream_url}")
+        logger.info(f"   Headers: {list(headers.keys())}")
+        logger.info(f"   Request format: {upstream_service_type}")
+        logger.info(f"   Request model: {final_request.get('model')}")
+        if upstream_service_type == 'anthropic':
+            logger.info(f"   Request messages: {len(final_request.get('messages', []))}")
+            logger.info(f"   Request max_tokens: {final_request.get('max_tokens')}")
+            logger.info(f"   Request stream: {final_request.get('stream')}")
+        else:
+            logger.info(f"   Request messages: {len(final_request.get('messages', [])) if 'messages' in final_request else len(final_request.get('contents', []))}")
+        
+        import json as json_mod
+        logger.debug(f"📦 Full upstream request: {json_mod.dumps(final_request, indent=2, ensure_ascii=False)[:1000]}")
         
         if body.stream:
             # Streaming response
             logger.info(f"📡 Starting Anthropic streaming response")
-            headers["Accept"] = "text/event-stream"
+            if "Accept" not in headers:
+                headers["Accept"] = "text/event-stream"
+            if upstream_service_type in ['openai', 'gemini']:
+                final_request["stream"] = True
             
             async def anthropic_stream_generator():
                 try:
-                    logger.debug(f"🔧 Anthropic stream generator started, has_function_call={has_function_call}")
+                    logger.debug(f"🔧 Anthropic stream generator started")
+                    logger.debug(f"   Upstream type: {upstream_service_type}")
+                    logger.debug(f"   Has function call injection: {has_function_call}")
                     
-                    # If function calling is enabled, use the special streaming handler
-                    if has_function_call:
-                        logger.debug(f"🔧 Using function calling streaming handler")
-                        # Stream through Toolify's FC processor, then convert to Anthropic format
-                        openai_stream = stream_proxy_with_fc_transform(
-                            upstream_url, 
-                            openai_request, 
-                            headers, 
-                            openai_request["model"], 
-                            True,  # has_fc=True
-                            GLOBAL_TRIGGER_SIGNAL,
-                            http_client,
-                            app_config.server.timeout
-                        )
-                        # Convert to Anthropic format
-                        chunk_count = 0
-                        async for anthropic_chunk in stream_openai_to_anthropic(openai_stream):
-                            chunk_count += 1
-                            if chunk_count <= 5 or chunk_count % 50 == 0:  # Log first 5 and every 50th chunk
-                                logger.debug(f"🔧 Yielding Anthropic chunk #{chunk_count}, type: {type(anthropic_chunk)}, size: {len(anthropic_chunk) if isinstance(anthropic_chunk, (str, bytes)) else 'N/A'}")
-                            yield anthropic_chunk.encode('utf-8') if isinstance(anthropic_chunk, str) else anthropic_chunk
-                        logger.debug(f"🔧 Function calling stream completed, total chunks: {chunk_count}")
-                    else:
-                        logger.debug(f"🔧 Using direct streaming (no function calling)")
-                        # No function calling, direct streaming
-                        async with http_client.stream("POST", upstream_url, json=openai_request, headers=headers, timeout=app_config.server.timeout) as response:
-                            logger.debug(f"🔧 Upstream response status: {response.status_code}")
-                            logger.debug(f"🔧 Upstream response headers: {dict(response.headers)}")
-                            
+                    # Anthropic → Anthropic: 直接透传
+                    if upstream_service_type == 'anthropic':
+                        logger.debug(f"🔧 Direct Anthropic streaming (no format conversion)")
+                        async with http_client.stream("POST", upstream_url, json=final_request, headers=headers, timeout=app_config.server.timeout) as response:
                             if response.status_code != 200:
                                 error_content = await response.aread()
                                 logger.error(f"❌ Upstream error: {response.status_code} - {error_content.decode('utf-8', errors='ignore')}")
                                 yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': 'Upstream service error'}})}\n\n"
                                 return
                             
+                            # 直接透传 Anthropic SSE 流
+                            async for chunk in response.aiter_bytes():
+                                yield chunk
+                    
+                    # Anthropic → OpenAI: 需要格式转换
+                    elif upstream_service_type == 'openai':
+                        # If function calling is enabled, use the special streaming handler
+                        if has_function_call:
+                            logger.debug(f"🔧 Using function calling streaming handler (OpenAI)")
+                            # Stream through Toolify's FC processor, then convert to Anthropic format
+                            openai_stream = stream_proxy_with_fc_transform(
+                                upstream_url, 
+                                final_request, 
+                                headers, 
+                                final_request["model"], 
+                                True,  # has_fc=True
+                                GLOBAL_TRIGGER_SIGNAL,
+                                http_client,
+                                app_config.server.timeout
+                            )
+                            # Convert to Anthropic format
                             chunk_count = 0
-                            async for converted_chunk in stream_openai_to_anthropic(response.aiter_bytes()):
+                            async for anthropic_chunk in stream_openai_to_anthropic(openai_stream):
                                 chunk_count += 1
                                 if chunk_count <= 5 or chunk_count % 50 == 0:
-                                    logger.debug(f"🔧 Yielding direct chunk #{chunk_count}")
-                                yield converted_chunk.encode('utf-8') if isinstance(converted_chunk, str) else converted_chunk
-                            logger.debug(f"🔧 Direct stream completed, total chunks: {chunk_count}")
+                                    logger.debug(f"🔧 Yielding Anthropic chunk #{chunk_count}")
+                                yield anthropic_chunk.encode('utf-8') if isinstance(anthropic_chunk, str) else anthropic_chunk
+                            logger.debug(f"🔧 Function calling stream completed, total chunks: {chunk_count}")
+                        else:
+                            logger.debug(f"🔧 Direct OpenAI streaming (no FC), will convert to Anthropic")
+                            # No function calling, direct streaming with format conversion
+                            async with http_client.stream("POST", upstream_url, json=final_request, headers=headers, timeout=app_config.server.timeout) as response:
+                                logger.debug(f"🔧 Upstream response status: {response.status_code}")
+                                logger.debug(f"🔧 Upstream response headers: {dict(response.headers)}")
+                                
+                                if response.status_code != 200:
+                                    error_content = await response.aread()
+                                    logger.error(f"❌ Upstream error: {response.status_code} - {error_content.decode('utf-8', errors='ignore')}")
+                                    yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': 'Upstream service error'}})}\n\n"
+                                    return
+                                
+                                chunk_count = 0
+                                async for converted_chunk in stream_openai_to_anthropic(response.aiter_bytes()):
+                                    chunk_count += 1
+                                    if chunk_count <= 5 or chunk_count % 50 == 0:
+                                        logger.debug(f"🔧 Yielding direct chunk #{chunk_count}")
+                                    yield converted_chunk.encode('utf-8') if isinstance(converted_chunk, str) else converted_chunk
+                                logger.debug(f"🔧 Direct stream completed, total chunks: {chunk_count}")
                             
                 except httpx.RemoteProtocolError as e:
                     logger.error(f"❌ Remote protocol error: {e}")
@@ -938,73 +1213,114 @@ async def anthropic_messages(
             )
         else:
             # Non-streaming response
-            logger.debug(f"🔧 Sending non-streaming request to upstream")
-            headers["Accept"] = "application/json"
+            logger.info("📡 Sending non-streaming request to upstream")
+            if "Accept" not in headers:
+                headers["Accept"] = "application/json"
             
             upstream_response = await http_client.post(
                 upstream_url,
-                json=openai_request,
+                json=final_request,
                 headers=headers,
                 timeout=app_config.server.timeout
             )
+            
+            logger.info("📥 UPSTREAM RESPONSE")
+            logger.info(f"   Status: {upstream_response.status_code}")
+            logger.info(f"   Headers: {dict(upstream_response.headers)}")
+            logger.info(f"   Body length: {len(upstream_response.text)} bytes")
+            logger.debug(f"   Body (first 1000 chars): {upstream_response.text[:1000]}")
+            
             upstream_response.raise_for_status()
             
-            openai_resp = upstream_response.json()
-            logger.debug(f"✅ Received response from upstream")
+            upstream_resp = upstream_response.json()
+            logger.info(f"✅ Received valid JSON response from upstream")
+            logger.info(f"   Response keys: {list(upstream_resp.keys())}")
             
-            # If function calling was enabled, check for tool calls in response
-            if has_function_call:
-                choice = openai_resp.get("choices", [{}])[0]
-                message = choice.get("message", {})
-                content = message.get("content", "")
+            # 根据上游类型处理响应
+            if upstream_service_type == 'anthropic':
+                # Anthropic → Anthropic: 直接返回
+                logger.info(f"   Strategy: Direct Anthropic response")
+                anthropic_resp = upstream_resp
+            
+            elif upstream_service_type == 'openai':
+                # OpenAI → Anthropic: 需要转换
+                logger.info(f"   Strategy: Convert OpenAI → Anthropic")
                 
-                # Check if response contains function call XML
-                if content and GLOBAL_TRIGGER_SIGNAL in content:
-                    logger.debug(f"🔧 Detected function call trigger signal in response")
-                    parsed_tools = parse_function_calls_xml(content, GLOBAL_TRIGGER_SIGNAL)
+                # If function calling was enabled, check for tool calls in response
+                if has_function_call:
+                    choice = upstream_resp.get("choices", [{}])[0]
+                    message = choice.get("message", {})
+                    content = message.get("content", "")
                     
-                    if parsed_tools:
-                        logger.info(f"🔧 Successfully parsed {len(parsed_tools)} function call(s)")
+                    # Check if response contains function call XML
+                    if content and GLOBAL_TRIGGER_SIGNAL in content:
+                        logger.debug(f"🔧 Detected function call trigger signal in response")
+                        parsed_tools = parse_function_calls_xml(content, GLOBAL_TRIGGER_SIGNAL)
                         
-                        # Convert to OpenAI tool_calls format
-                        tool_calls = []
-                        for tool in parsed_tools:
-                            tool_call_id = f"call_{uuid.uuid4().hex}"
-                            # Store mapping for potential future lookups
-                            store_tool_call_mapping(
-                                tool_call_id,
-                                tool["name"],
-                                tool["args"],
-                                f"Calling tool {tool['name']}"
-                            )
-                            tool_calls.append({
-                                "id": tool_call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": tool["name"],
-                                    "arguments": json.dumps(tool["args"])
-                                }
-                            })
-                        
-                        # Update OpenAI response with tool_calls
-                        openai_resp["choices"][0]["message"] = {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": tool_calls
-                        }
-                        openai_resp["choices"][0]["finish_reason"] = "tool_calls"
-                        logger.debug(f"🔧 Converted XML function calls to OpenAI tool_calls format")
+                        if parsed_tools:
+                            logger.info(f"🔧 Successfully parsed {len(parsed_tools)} function call(s)")
+                            
+                            # Convert to OpenAI tool_calls format
+                            tool_calls = []
+                            for tool in parsed_tools:
+                                tool_call_id = f"call_{uuid.uuid4().hex}"
+                                store_tool_call_mapping(
+                                    tool_call_id,
+                                    tool["name"],
+                                    tool["args"],
+                                    f"Calling tool {tool['name']}"
+                                )
+                                tool_calls.append({
+                                    "id": tool_call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool["name"],
+                                        "arguments": json.dumps(tool["args"])
+                                    }
+                                })
+                            
+                            # Update OpenAI response with tool_calls
+                            upstream_resp["choices"][0]["message"] = {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": tool_calls
+                            }
+                            upstream_resp["choices"][0]["finish_reason"] = "tool_calls"
+                            logger.debug(f"🔧 Converted XML function calls to OpenAI tool_calls format")
+                
+                # Convert OpenAI response to Anthropic format
+                anthropic_resp = openai_to_anthropic_response(upstream_resp)
             
-            # Convert OpenAI response to Anthropic format
-            anthropic_resp = openai_to_anthropic_response(openai_resp)
+            elif upstream_service_type == 'gemini':
+                # Gemini → Anthropic: 需要转换
+                logger.info(f"   Strategy: Convert Gemini → Anthropic")
+                from toolify_core.converters import convert_response
+                conversion = convert_response("gemini", "anthropic", upstream_resp, body.model)
+                if conversion.success:
+                    anthropic_resp = conversion.data
+                else:
+                    logger.error(f"❌ Response conversion failed: {conversion.error}")
+                    raise HTTPException(status_code=500, detail=f"Response conversion failed: {conversion.error}")
+            
+            else:
+                raise HTTPException(status_code=500, detail=f"Unsupported upstream type: {upstream_service_type}")
+            
+            logger.info(f"✅ Converted to Anthropic format")
+            logger.info(f"   Response keys: {list(anthropic_resp.keys())}")
+            logger.info(f"   Response type: {anthropic_resp.get('type')}")
+            logger.info(f"   Response role: {anthropic_resp.get('role')}")
+            logger.info(f"   Content blocks: {len(anthropic_resp.get('content', []))}")
+            logger.info(f"   Stop reason: {anthropic_resp.get('stop_reason')}")
+            logger.debug(f"📦 Full Anthropic response: {str(anthropic_resp)[:1000]}")
             
             elapsed_time = time.time() - start_time
-            logger.info("=" * 60)
-            logger.info(f"📊 Anthropic API Response - Model: {body.model}")
+            logger.info("=" * 80)
+            logger.info(f"📊 ANTHROPIC API RESPONSE SUMMARY")
+            logger.info(f"   Model: {body.model}")
             logger.info(f"   Input Tokens: {anthropic_resp['usage']['input_tokens']}")
             logger.info(f"   Output Tokens: {anthropic_resp['usage']['output_tokens']}")
             logger.info(f"   Duration: {elapsed_time:.2f}s")
-            logger.info("=" * 60)
+            logger.info("=" * 80)
             
             return JSONResponse(content=anthropic_resp)
             
@@ -1039,6 +1355,7 @@ async def anthropic_messages(
 @app.get("/v1/models")
 async def list_models(_api_key: str = Depends(verify_api_key)):
     """List all available models."""
+    ensure_config_loaded()
     visible_models = set()
     for model_name in MODEL_TO_SERVICE_MAPPING.keys():
         if ':' in model_name:
@@ -1152,6 +1469,325 @@ async def update_config(config_data: dict, _username: str = Depends(verify_admin
         raise HTTPException(status_code=500, detail=f"Failed to update configuration: {str(e)}")
 
 
+# Gemini API key extraction
+async def verify_gemini_api_key(request: Request) -> str:
+    """Verify Gemini API key from query parameter or header"""
+    logger.debug(f"🔐 Gemini API Key Verification")
+    
+    client_key = None
+    
+    # Priority 1: URL parameter ?key=
+    api_key = request.query_params.get("key")
+    if api_key:
+        logger.debug(f"   Using URL parameter key: ***{api_key[-8:] if len(api_key) > 8 else '***'}")
+        client_key = api_key
+    
+    # Priority 2: x-goog-api-key header
+    elif request.headers.get("x-goog-api-key"):
+        x_goog_key = request.headers.get("x-goog-api-key")
+        logger.debug(f"   Using x-goog-api-key header: ***{x_goog_key[-8:]}")
+        client_key = x_goog_key
+    
+    # Priority 3: Authorization Bearer
+    elif request.headers.get("authorization"):
+        authorization = request.headers.get("authorization")
+        if authorization.startswith("Bearer "):
+            client_key = authorization[7:]
+            logger.debug(f"   Using Authorization Bearer: ***{client_key[-8:]}")
+        else:
+            client_key = authorization
+    
+    # Check if key was found
+    if not client_key:
+        logger.error("❌ Missing Gemini API key")
+        raise HTTPException(
+            status_code=401,
+            detail="Missing API key. Provide via 'key' parameter, 'x-goog-api-key', or 'Authorization' header"
+        )
+    
+    # Validate key if not in passthrough mode
+    if not app_config.features.key_passthrough:
+        logger.debug(f"   Validating against {len(ALLOWED_CLIENT_KEYS)} allowed keys")
+        logger.debug(f"   Allowed keys: {[f'***{k[-8:]}' for k in ALLOWED_CLIENT_KEYS]}")
+        
+        if client_key not in ALLOWED_CLIENT_KEYS:
+            logger.error(f"❌ Unauthorized Gemini key: ***{client_key[-8:]}")
+            raise HTTPException(status_code=401, detail="Unauthorized API key")
+    else:
+        logger.debug(f"   Mode: Key passthrough (validation skipped)")
+    
+    logger.debug(f"✅ Gemini key validated successfully")
+    return client_key
+
+
+# Gemini API unified endpoint (支持多种路径格式和流式/非流式)
+@app.post("/v1beta/models/{model_path:path}")
+@app.post("/v1/models/{model_path:path}")
+@app.post("/v1/v1beta/models/{model_path:path}")  # 兼容性路由
+@app.post("/v1/v1beta/{model_path:path}")  # 缺少models/的路径
+async def gemini_stream_generate_content(
+    model_path: str,
+    request: Request,
+    _api_key: str = Depends(verify_gemini_api_key)
+):
+    """Gemini API endpoint (支持 generateContent 和 streamGenerateContent)"""
+    ensure_config_loaded()
+    
+    # 解析模型ID和操作类型
+    import urllib.parse
+    model_path = urllib.parse.unquote(model_path)
+    
+    # 提取模型ID和操作（:generateContent 或 :streamGenerateContent）
+    if ":streamGenerateContent" in model_path:
+        model_id = model_path.replace(":streamGenerateContent", "")
+        is_streaming = True
+        operation = "streamGenerateContent"
+    elif ":generateContent" in model_path:
+        model_id = model_path.replace(":generateContent", "")
+        is_streaming = False
+        operation = "generateContent"
+    else:
+        # 可能没有操作后缀，根据URL参数判断
+        model_id = model_path
+        is_streaming = "alt=sse" in str(request.url)
+        operation = "streamGenerateContent" if is_streaming else "generateContent"
+    
+    logger.info("=" * 80)
+    logger.info(f"🤖 GEMINI API REQUEST ({'STREAMING' if is_streaming else 'NON-STREAMING'})")
+    logger.info("=" * 80)
+    logger.info(f"   Original URL: {request.url}")
+    logger.info(f"   Model path: {model_path}")
+    logger.info(f"   Model ID (cleaned): {model_id}")
+    logger.info(f"   Operation: {operation}")
+    logger.info(f"   Is streaming: {is_streaming}")
+    logger.info(f"   API Key: ***{_api_key[-8:] if len(_api_key) > 8 else '***'}")
+    logger.info(f"   Query params: {dict(request.query_params)}")
+    
+    try:
+        request_data = await request.json()
+        request_data["model"] = model_id
+        request_data["stream"] = is_streaming
+        
+        logger.info(f"   Contents: {len(request_data.get('contents', []))} items")
+        logger.info(f"   System instruction: {'Yes' if request_data.get('systemInstruction') else 'No'}")
+        logger.info(f"   Tools: {len(request_data.get('tools', []))} tools")
+        logger.info("=" * 80)
+        
+        # Find upstream for this model
+        upstreams, actual_model = find_upstream(
+            model_id,
+            MODEL_TO_SERVICE_MAPPING,
+            ALIAS_MAPPING,
+            DEFAULT_SERVICE,
+            app_config.features.model_passthrough,
+            app_config.upstream_services
+        )
+        
+        upstream = upstreams[0]
+        
+        logger.info(f"🎯 Selected upstream: {upstream['name']} (type: {upstream.get('service_type')})")
+        
+        # Handle format conversion if needed
+        if upstream.get("service_type") != "gemini":
+            # Convert Gemini request to target format
+            from toolify_core.converters import convert_request
+            conversion = convert_request("gemini", upstream["service_type"], request_data)
+            if not conversion.success:
+                raise HTTPException(status_code=400, detail=f"Conversion failed: {conversion.error}")
+            request_data = conversion.data
+        
+        # Prepare upstream URL and headers based on service type and streaming mode
+        if upstream.get("service_type") == "gemini":
+            # Gemini service
+            if is_streaming:
+                url = f"{upstream['base_url']}/models/{actual_model}:streamGenerateContent?alt=sse&key={upstream['api_key']}"
+                headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+            else:
+                url = f"{upstream['base_url']}/models/{actual_model}:generateContent?key={upstream['api_key']}"
+                headers = {"Content-Type": "application/json"}
+        
+        elif upstream.get("service_type") == "openai":
+            # OpenAI service
+            url = f"{upstream['base_url']}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {upstream['api_key']}",
+                "Content-Type": "application/json"
+            }
+            if is_streaming:
+                headers["Accept"] = "text/event-stream"
+                request_data["stream"] = True
+            else:
+                request_data["stream"] = False
+        
+        elif upstream.get("service_type") == "anthropic":
+            # Anthropic service
+            url = f"{upstream['base_url']}/v1/messages"
+            headers = {
+                "x-api-key": upstream['api_key'],
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json"
+            }
+            if is_streaming:
+                headers["Accept"] = "text/event-stream"
+                request_data["stream"] = True
+            else:
+                request_data["stream"] = False
+        
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported service type: {upstream.get('service_type')}")
+        
+        logger.info(f"🚀 {'Streaming' if is_streaming else 'Sending'} to: {url}")
+        
+        # Handle based on streaming flag
+        if not is_streaming:
+            # Non-streaming request
+            logger.info("📤 DETAILED REQUEST TO UPSTREAM")
+            logger.info(f"   URL: {url}")
+            logger.info(f"   Headers: {dict((k, '***' + v[-8:] if k.lower() == 'authorization' else v) for k, v in headers.items())}")
+            logger.info(f"   Body keys: {list(request_data.keys())}")
+            logger.info(f"   Body.model: {request_data.get('model')}")
+            logger.info(f"   Body.messages: {request_data.get('messages')}")
+            logger.info(f"   Body.max_tokens: {request_data.get('max_tokens')}")
+            logger.info(f"   Body.stream: {request_data.get('stream')}")
+            
+            import json as json_module
+            logger.debug(f"📦 Complete request body:")
+            logger.debug(json_module.dumps(request_data, indent=2, ensure_ascii=False))
+            
+            async with httpx.AsyncClient(timeout=app_config.server.timeout) as client:
+                response = await client.post(url, json=request_data, headers=headers)
+                
+                logger.info(f"📥 Upstream response: {response.status_code}")
+                logger.info(f"   Response headers: {dict(response.headers)}")
+                logger.info(f"   Response body length: {len(response.text)} bytes")
+                logger.debug(f"   Response body (first 500 chars): {response.text[:500]}")
+                
+                if response.status_code != 200:
+                    error_content = response.text
+                    logger.error(f"❌ Upstream error: {response.status_code}")
+                    logger.error(f"   Error body: {error_content}")
+                    logger.error(f"   Sent URL: {url}")
+                    logger.error(f"   Sent headers: {dict((k, '***' if 'key' in k.lower() or 'auth' in k.lower() else v) for k, v in headers.items())}")
+                    logger.error(f"   Sent body: {json_module.dumps(request_data, indent=2, ensure_ascii=False)[:1000]}")
+                    raise HTTPException(status_code=response.status_code, detail=error_content)
+                
+                # Parse response JSON with better error handling
+                try:
+                    response_data = response.json()
+                    logger.info(f"✅ Parsed response JSON successfully")
+                    logger.info(f"   Response keys: {list(response_data.keys())}")
+                except json_module.JSONDecodeError as e:
+                    logger.error(f"❌ Failed to parse response JSON: {e}")
+                    logger.error(f"   Response text: {response.text[:1000]}")
+                    logger.error(f"   Response content-type: {response.headers.get('content-type')}")
+                    raise HTTPException(status_code=500, detail=f"Invalid JSON response from upstream: {e}")
+                
+                # Convert response back if needed
+                if upstream.get("service_type") != "gemini":
+                    logger.info(f"🔄 Converting response from {upstream.get('service_type')} to Gemini format")
+                    from toolify_core.converters import convert_response
+                    conversion = convert_response(upstream["service_type"], "gemini", response_data, model_id)
+                    if conversion.success:
+                        logger.info(f"✅ Conversion successful")
+                        response_data = conversion.data
+                    else:
+                        logger.error(f"❌ Response conversion failed: {conversion.error}")
+                        # Return original data as fallback
+                
+                logger.debug(f"📦 Final response: {json_module.dumps(response_data, indent=2, ensure_ascii=False)[:500]}")
+                return JSONResponse(content=response_data)
+        
+        # Streaming response
+        async def gemini_stream_generator():
+            async with httpx.AsyncClient(timeout=app_config.server.timeout) as client:
+                async with client.stream("POST", url, json=request_data, headers=headers) as response:
+                    logger.info(f"📥 Upstream response: {response.status_code}")
+                    
+                    if response.status_code != 200:
+                        error_content = await response.aread()
+                        logger.error(f"❌ Upstream error: {response.status_code} - {error_content.decode('utf-8', errors='ignore')}")
+                        # Send Gemini error format
+                        yield f"data: {json.dumps({'error': {'message': 'Upstream error', 'status': response.status_code}})}\n\n"
+                        return
+                    
+                    # Direct passthrough or convert based on upstream type
+                    if upstream.get("service_type") == "gemini":
+                        # Direct passthrough
+                        async for chunk in response.aiter_bytes():
+                            if chunk:
+                                yield chunk
+                    else:
+                        # Need to convert from OpenAI/Anthropic to Gemini format
+                        # For now, simple passthrough (TODO: implement conversion)
+                        async for chunk in response.aiter_bytes():
+                            if chunk:
+                                yield chunk
+        
+        return StreamingResponse(
+            gemini_stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Gemini streaming API error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Capability detection endpoints
+@app.post("/api/detect/capabilities")
+async def detect_capabilities(
+    request: Request,
+    _username: str = Depends(verify_admin_token)
+):
+    """
+    Detect AI provider capabilities.
+    Request body: {"provider": "openai|anthropic|gemini", "api_key": "...", "base_url": "...", "model": "..."}
+    """
+    try:
+        data = await request.json()
+        provider = data.get("provider")
+        api_key = data.get("api_key")
+        base_url = data.get("base_url")
+        model = data.get("model")
+        
+        if not provider or not api_key:
+            raise HTTPException(status_code=400, detail="Missing provider or api_key")
+        
+        # Create detector
+        detector = DetectorFactory.create_detector(provider, api_key, base_url, model)
+        if not detector:
+            raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
+        
+        # Run detection
+        logger.info(f"Starting capability detection for {provider}")
+        report = await detector.detect_all_capabilities()
+        
+        return JSONResponse(content=report.to_dict())
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Capability detection error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/detect/providers")
+async def list_supported_providers(_username: str = Depends(verify_admin_token)):
+    """List supported providers for capability detection"""
+    return {
+        "providers": DetectorFactory.get_supported_providers(),
+        "formats": ConverterFactory.get_supported_formats()
+    }
+
+
 # Mount static files for admin interface (if exists)
 try:
     if os.path.exists("frontend/dist"):
@@ -1161,16 +1797,97 @@ except Exception as e:
     logger.warning(f"⚠️  Failed to mount admin interface: {e}")
 
 
-if __name__ == "__main__":
-    import uvicorn
+@app.on_event("startup")
+async def startup_event():
+    """Startup event - load configuration"""
+    global _config_loaded
+    if not _config_loaded:
+        try:
+            load_runtime_config()
+            _config_loaded = True
+            logger.info("✅ Configuration loaded on server startup")
+        except Exception as e:
+            logger.error(f"❌ FATAL: Configuration loading failed")
+            logger.error(f"❌ Error: {type(e).__name__}: {str(e)}")
 
-    logger.info(f"🚀 Starting server on {app_config.server.host}:{app_config.server.port}")
-    logger.info(f"⏱️  Request timeout: {app_config.server.timeout} seconds")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Shutdown event - cleanup"""
+    logger.info("👋 Server shutting down...")
+    await http_client.aclose()
+
+
+def main():
+    """
+    Main entry point for running the server.
+    This function can be called directly from PyCharm or command line.
+    """
+    import uvicorn
+    import sys
     
-    uvicorn.run(
-        app,
-        host=app_config.server.host,
-        port=app_config.server.port,
-        log_level=app_config.features.log_level.lower() if app_config.features.log_level != "DISABLED" else "critical"
+    # Setup basic logging for startup
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
     )
+    
+    print("=" * 80)
+    print("🚀 Toolify - LLM Function Calling Middleware")
+    print("=" * 80)
+    
+    # Try to load config to get server settings
+    try:
+        load_runtime_config()
+        host = app_config.server.host
+        port = app_config.server.port
+        timeout = app_config.server.timeout
+        log_level = app_config.features.log_level.lower() if app_config.features.log_level != "DISABLED" else "critical"
+        
+        print(f"📋 Configuration loaded from: {config_loader.config_path}")
+        print(f"🌐 Server will start on: http://{host}:{port}")
+        print(f"⏱️  Request timeout: {timeout} seconds")
+        print(f"📊 Upstream services: {len(app_config.upstream_services)}")
+        print(f"🔑 Client keys configured: {len(app_config.client_authentication.allowed_keys)}")
+        print(f"📝 Log level: {app_config.features.log_level}")
+        print("=" * 80)
+        print()
+        
+    except FileNotFoundError:
+        print("❌ ERROR: config.yaml not found!")
+        print("💡 Please copy config.example.yaml to config.yaml and configure it")
+        print("=" * 80)
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ ERROR: Failed to load configuration: {type(e).__name__}")
+        print(f"   Details: {str(e)}")
+        print("💡 Please check your config.yaml file for syntax errors")
+        print("=" * 80)
+        sys.exit(1)
+    
+    # Start the server
+    try:
+        logger.info(f"🚀 Starting Uvicorn server on {host}:{port}")
+        uvicorn.run(
+            app,
+            host=host,
+            port=port,
+            log_level=log_level,
+            access_log=True
+        )
+    except KeyboardInterrupt:
+        print("\n" + "=" * 80)
+        print("👋 Server stopped by user")
+        print("=" * 80)
+    except Exception as e:
+        print("\n" + "=" * 80)
+        print(f"❌ Server crashed: {type(e).__name__}")
+        print(f"   Details: {str(e)}")
+        print("=" * 80)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
 

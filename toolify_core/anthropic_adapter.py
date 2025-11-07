@@ -206,6 +206,7 @@ async def stream_openai_to_anthropic(openai_stream_generator):
     tool_call_started = False
     current_tool_call = {}
     chunk_count = 0
+    total_text_sent = ""  # Track all text content for debugging
     
     try:
         async for chunk in openai_stream_generator:
@@ -235,28 +236,49 @@ async def stream_openai_to_anthropic(openai_stream_generator):
                         logger.debug("🔧 Sent message_stop event")
                         break
                     elif line_data:
-                        # Handle SSE format issues when upstream buffers multiple events
-                        chunk_json = None
+                        # Handle SSE format - extract ALL JSON objects from line_data
+                        # Some upstreams may pack multiple JSON objects in one SSE line
+                        chunk_jsons = []
                         
                         try:
-                            # First try: parse as-is
-                            chunk_json = json.loads(line_data)
+                            # Try parsing as single JSON first
+                            chunk_jsons = [json.loads(line_data)]
                         except json.JSONDecodeError:
-                            # Second try: extract first complete JSON using decoder
-                            try:
-                                decoder = json.JSONDecoder()
-                                obj, idx = decoder.raw_decode(line_data)
-                                chunk_json = obj
-                                if idx < len(line_data):
-                                    logger.debug(f"🔧 Extracted first JSON, ignored {len(line_data) - idx} extra chars")
-                            except:
-                                # Third try: it might be a fragment, just skip silently
-                                pass
+                            # May contain multiple JSON objects - extract them all
+                            decoder = json.JSONDecoder()
+                            idx = 0
+                            while idx < len(line_data):
+                                # Skip whitespace
+                                while idx < len(line_data) and line_data[idx] in ' \t\n\r':
+                                    idx += 1
+                                
+                                if idx >= len(line_data):
+                                    break
+                                
+                                try:
+                                    obj, end_idx = decoder.raw_decode(line_data, idx)
+                                    chunk_jsons.append(obj)
+                                    idx = end_idx
+                                except json.JSONDecodeError as e:
+                                    # Can't parse remaining data
+                                    remaining = line_data[idx:]
+                                    if remaining.strip():  # Only log if non-empty
+                                        logger.warning(f"⚠️ Unparseable data at position {idx}: {remaining[:100]}")
+                                    break
                         
-                        if not chunk_json:
+                        if not chunk_jsons:
+                            logger.debug(f"🔧 No valid JSON found in chunk, skipping")
                             continue
                         
-                        if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
+                        if len(chunk_jsons) > 1:
+                            logger.debug(f"🔧 Extracted {len(chunk_jsons)} JSON objects from one SSE line")
+                        
+                        # Process ALL JSON objects
+                        for chunk_json in chunk_jsons:
+                            if "choices" not in chunk_json or len(chunk_json["choices"]) == 0:
+                                logger.debug(f"🔧 Chunk has no choices, skipping")
+                                continue
+                            
                             choice = chunk_json["choices"][0]
                             delta = choice.get("delta", {})
                             logger.debug(f"🔧 Delta content: role={delta.get('role')}, content={bool(delta.get('content'))}, tool_calls={bool(delta.get('tool_calls'))}")
@@ -273,6 +295,7 @@ async def stream_openai_to_anthropic(openai_stream_generator):
                                     yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': current_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
                                 
                                 # Send content_block_delta event
+                                total_text_sent += content  # Track sent text
                                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': current_block_index, 'delta': {'type': 'text_delta', 'text': content}})}\n\n"
                             
                             # Handle tool_calls
@@ -347,5 +370,8 @@ async def stream_openai_to_anthropic(openai_stream_generator):
         }
         yield f"event: error\ndata: {json.dumps(error_event)}\n\n"
     finally:
-        logger.debug(f"🔧 Stream conversion completed, total chunks: {chunk_count}")
+        logger.info(f"🔧 Stream conversion completed")
+        logger.info(f"   Total chunks processed: {chunk_count}")
+        logger.info(f"   Total text content sent: {len(total_text_sent)} characters")
+        logger.debug(f"   Full text sent: {total_text_sent}")
 

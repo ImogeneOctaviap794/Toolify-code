@@ -26,7 +26,9 @@
 - 🎨 **Web 管理界面** - React 19 + TypeScript 可视化配置
 - ⚡ **实时配置重载** - 无需重启即可生效
 - 🔄 **多渠道故障转移** - 智能优先级路由
-- 🌐 **多 API 格式支持** - OpenAI + Anthropic Claude 格式
+- 🌐 **多 API 格式支持** - OpenAI + Anthropic + Gemini 三向互转！
+- 🔍 **能力检测** - 自动测试 AI 提供商功能
+- 🧠 **思考预算转换** - 智能转换 reasoning_effort 和 thinking tokens
 - 📱 **响应式设计** - 完美适配移动端和桌面端
 
 </div>
@@ -58,7 +60,9 @@
 ### 🛡️ 企业级功能
 
 - 🔄 **多渠道故障转移** - 智能优先级路由，自动切换备用通道
-- 🌐 **多 API 格式** - 支持 OpenAI + Anthropic Claude 双格式
+- 🌐 **多 API 格式** - OpenAI + Anthropic + Gemini 三向互转
+- 🔍 **能力检测** - 自动化 AI 功能测试
+- 🧠 **思考预算转换** - 智能 effort/token 转换
 - 🔐 **安全认证** - JWT Token + bcrypt 加密管理员系统
 - ⚡ **实时重载** - 配置修改立即生效，零停机更新
 - 📊 **可视化管理** - 现代 Web 界面，一键配置所有选项

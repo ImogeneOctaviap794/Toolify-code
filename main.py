@@ -109,6 +109,140 @@ def build_upstream_url(base_url: str, endpoint: str) -> str:
     return base_url + endpoint
 
 
+async def convert_anthropic_stream_to_gemini(line_iterator, model: str):
+    """将 Anthropic SSE 流转换为 Gemini SSE 格式"""
+    accumulated_text = ""
+    
+    async for line in line_iterator:
+        if not line or not line.strip():
+            continue
+        
+        # Anthropic 使用 event: 和 data: 格式
+        if line.startswith("event:"):
+            event_type = line[6:].strip()
+            logger.debug(f"🔧 Anthropic event: {event_type}")
+            continue
+        
+        if line.startswith("data:"):
+            data_str = line[5:].strip()
+            
+            try:
+                data = json.loads(data_str)
+                event_type = data.get("type")
+                
+                # 处理 content_block_delta 事件（包含文本内容）
+                if event_type == "content_block_delta":
+                    delta = data.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        text = delta.get("text", "")
+                        accumulated_text += text
+                        
+                        # 发送 Gemini 格式的chunk
+                        gemini_chunk = {
+                            "candidates": [{
+                                "content": {
+                                    "parts": [{"text": text}],
+                                    "role": "model"
+                                },
+                                "index": 0
+                            }]
+                        }
+                        yield f"data: {json.dumps(gemini_chunk, ensure_ascii=False)}\n\n"
+                
+                # 处理 message_stop 事件（流结束）
+                elif event_type == "message_stop":
+                    # 发送最后的 chunk 带 finishReason
+                    gemini_final = {
+                        "candidates": [{
+                            "content": {
+                                "parts": [{"text": ""}],
+                                "role": "model"
+                            },
+                            "finishReason": "STOP",
+                            "index": 0
+                        }]
+                    }
+                    yield f"data: {json.dumps(gemini_final, ensure_ascii=False)}\n\n"
+                    logger.debug(f"🔧 Anthropic → Gemini stream completed, total text: {len(accumulated_text)} chars")
+                    break
+                
+            except json.JSONDecodeError:
+                logger.debug(f"🔧 Skipping non-JSON line: {line[:100]}")
+                continue
+
+
+async def convert_openai_stream_to_gemini(line_iterator, model: str):
+    """将 OpenAI SSE 流转换为 Gemini SSE 格式"""
+    accumulated_text = ""
+    
+    async for line in line_iterator:
+        if not line or not line.strip():
+            continue
+        
+        if line.startswith("data:"):
+            data_str = line[5:].strip()
+            
+            if data_str == "[DONE]":
+                # OpenAI 流结束
+                gemini_final = {
+                    "candidates": [{
+                        "content": {
+                            "parts": [{"text": ""}],
+                            "role": "model"
+                        },
+                        "finishReason": "STOP",
+                        "index": 0
+                    }]
+                }
+                yield f"data: {json.dumps(gemini_final, ensure_ascii=False)}\n\n"
+                logger.debug(f"🔧 OpenAI → Gemini stream completed, total text: {len(accumulated_text)} chars")
+                break
+            
+            try:
+                data = json.loads(data_str)
+                choices = data.get("choices", [])
+                
+                if choices:
+                    choice = choices[0]
+                    delta = choice.get("delta", {})
+                    content = delta.get("content", "")
+                    
+                    if content:
+                        accumulated_text += content
+                        
+                        # 发送 Gemini 格式的chunk
+                        gemini_chunk = {
+                            "candidates": [{
+                                "content": {
+                                    "parts": [{"text": content}],
+                                    "role": "model"
+                                },
+                                "index": 0
+                            }]
+                        }
+                        yield f"data: {json.dumps(gemini_chunk, ensure_ascii=False)}\n\n"
+                    
+                    # 处理 finish_reason
+                    finish_reason = choice.get("finish_reason")
+                    if finish_reason:
+                        gemini_reason = "STOP" if finish_reason == "stop" else "MAX_TOKENS"
+                        gemini_final = {
+                            "candidates": [{
+                                "content": {
+                                    "parts": [{"text": ""}],
+                                    "role": "model"
+                                },
+                                "finishReason": gemini_reason,
+                                "index": 0
+                            }]
+                        }
+                        yield f"data: {json.dumps(gemini_final, ensure_ascii=False)}\n\n"
+                
+            except json.JSONDecodeError:
+                logger.debug(f"🔧 Skipping non-JSON line: {line[:100]}")
+                continue
+
+
 # Global variables
 app_config: AppConfig = None
 MODEL_TO_SERVICE_MAPPING: Dict[str, List[Dict[str, Any]]] = {}
@@ -1074,6 +1208,16 @@ async def anthropic_messages(
             # Anthropic → Anthropic: 直接使用原始 Anthropic 格式
             logger.info(f"   Strategy: Direct Anthropic passthrough")
             final_request = anthropic_dict  # 使用原始 Anthropic 请求
+            
+            # 🔧 清理 None 值，防止上游服务解析错误
+            # 某些上游服务在处理 None 值时会报错（如尝试将 None 转为 float）
+            final_request = {k: v for k, v in final_request.items() if v is not None}
+            
+            # 🔧 确保 max_tokens 有有效值（Anthropic API 必需参数）
+            if "max_tokens" not in final_request or final_request.get("max_tokens") is None:
+                final_request["max_tokens"] = 4096
+                logger.debug(f"🔧 Added default max_tokens=4096 for Anthropic upstream")
+            
             upstream_url = f"{upstream['base_url'].rstrip('/')}/v1/messages"
             headers = {
                 "Content-Type": "application/json",
@@ -1084,6 +1228,10 @@ async def anthropic_messages(
             # Anthropic → OpenAI: 使用已转换的 OpenAI 格式
             logger.info(f"   Strategy: Convert to OpenAI format")
             final_request = openai_request
+            
+            # 🔧 清理 None 值，防止上游服务解析错误
+            final_request = {k: v for k, v in final_request.items() if v is not None}
+            
             upstream_url = build_upstream_url(upstream['base_url'], '/chat/completions')
             headers = {
                 "Content-Type": "application/json",
@@ -1093,10 +1241,18 @@ async def anthropic_messages(
             # Anthropic → Gemini: 需要转换为 Gemini 格式
             logger.info(f"   Strategy: Convert to Gemini format")
             from toolify_core.converters import convert_request
-            conversion = convert_request("anthropic", "gemini", anthropic_dict)
+            
+            # 🔧 在转换前清理 None 值
+            anthropic_dict_clean = {k: v for k, v in anthropic_dict.items() if v is not None}
+            
+            conversion = convert_request("anthropic", "gemini", anthropic_dict_clean)
             if not conversion.success:
                 raise HTTPException(status_code=500, detail=f"Format conversion failed: {conversion.error}")
             final_request = conversion.data
+            
+            # 🔧 清理转换后的 None 值
+            final_request = {k: v for k, v in final_request.items() if v is not None}
+            
             # Gemini 需要从 final_request 中移除 model 和 stream 字段
             gemini_model = final_request.pop('model', actual_model)
             final_request.pop('stream', None)
@@ -1712,16 +1868,27 @@ async def gemini_stream_generate_content(
                     
                     # Direct passthrough or convert based on upstream type
                     if upstream.get("service_type") == "gemini":
-                        # Direct passthrough
+                        # Gemini → Gemini: Direct passthrough
+                        logger.debug("🔧 Direct Gemini streaming passthrough")
                         async for chunk in response.aiter_bytes():
                             if chunk:
                                 yield chunk
+                    
+                    elif upstream.get("service_type") == "anthropic":
+                        # Anthropic → Gemini: 需要转换流式格式
+                        logger.debug("🔧 Converting Anthropic SSE stream to Gemini format")
+                        async for gemini_chunk in convert_anthropic_stream_to_gemini(response.aiter_lines(), model_id):
+                            yield gemini_chunk
+                    
+                    elif upstream.get("service_type") == "openai":
+                        # OpenAI → Gemini: 需要转换流式格式
+                        logger.debug("🔧 Converting OpenAI SSE stream to Gemini format")
+                        async for gemini_chunk in convert_openai_stream_to_gemini(response.aiter_lines(), model_id):
+                            yield gemini_chunk
+                    
                     else:
-                        # Need to convert from OpenAI/Anthropic to Gemini format
-                        # For now, simple passthrough (TODO: implement conversion)
-                        async for chunk in response.aiter_bytes():
-                            if chunk:
-                                yield chunk
+                        logger.error(f"❌ Unsupported upstream type for Gemini streaming: {upstream.get('service_type')}")
+                        yield f"data: {json.dumps({'error': {'message': 'Unsupported upstream type'}})}\n\n"
         
         return StreamingResponse(
             gemini_stream_generator(),

@@ -93,7 +93,7 @@ Example 2 - Using CDATA (recommended for HTML/XML):
 <head>
   <title>Test</title>
   <style>
-    body { margin: 0; }
+    body {{ margin: 0; }}
   </style>
 </head>
 <body>
